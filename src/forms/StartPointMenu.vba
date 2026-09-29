@@ -126,6 +126,49 @@ FatalFail:
                           BuildSummary(stats), vbCritical
 End Sub
 
+' Kontrol ini sengaja menumpang sementara di SPO
+Private Sub cmdZOrder_Click()
+    Dim doc As Document
+    Dim selectedShapes As ShapeRange
+    Dim resultText As String
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ZOrderFailed
+
+    On Error Resume Next
+    Set doc = ActiveDocument
+    On Error GoTo ZOrderFailed
+    If doc Is Nothing Then
+        ShowMessageAfterClose "Tidak ada dokumen aktif.", vbExclamation
+        Exit Sub
+    End If
+
+    On Error Resume Next
+    Set selectedShapes = ActiveSelectionRange
+    On Error GoTo ZOrderFailed
+    If selectedShapes Is Nothing Then
+        ShowMessageAfterClose "Pilih group atau curve terlebih dahulu.", vbExclamation
+        Exit Sub
+    End If
+    If selectedShapes.Count = 0 Then
+        ShowMessageAfterClose "Pilih group atau curve terlebih dahulu.", vbExclamation
+        Exit Sub
+    End If
+
+    resultText = SPOZOrderSelected(doc, selectedShapes)
+    ShowMessageAfterClose resultText, vbInformation
+    Exit Sub
+
+ZOrderFailed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    ShowMessageAfterClose "ZOrder gagal." & vbCrLf & _
+                          "Err.Number: " & errorNumber & vbCrLf & _
+                          "Err.Description: " & errorDescription, vbCritical
+
+End Sub
+
 Private Sub optClockwise_Click()
     If optClockwise.Value Then optCounterClockwise.Value = False
 End Sub
@@ -174,7 +217,7 @@ Private Sub ProcessShape(ByVal shp As Shape, ByVal targetClockwise As Boolean, _
         Exit Sub
     End If
 
-    subpathCount = crv.Subpaths.Count
+    subpathCount = crv.SubPaths.Count
     For subpathIndex = 1 To subpathCount
         ProcessSubPath crv, subpathIndex, targetClockwise, stats
     Next subpathIndex
@@ -198,7 +241,7 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
 
     On Error GoTo SubPathFail
 
-    Set sp = crv.Subpaths(subpathIndex)
+    Set sp = crv.SubPaths(subpathIndex)
     stats.SubpathsSeen = stats.SubpathsSeen + 1
 
     If Not sp.Closed Then
@@ -209,7 +252,7 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
     If sp.IsClockwise <> targetClockwise Then
         sp.ReverseDirection
         stats.DirectionReversed = stats.DirectionReversed + 1
-        Set sp = crv.Subpaths(subpathIndex)
+        Set sp = crv.SubPaths(subpathIndex)
     End If
 
     If TryGetNodeOutgoingAngle(sp.StartNode, startAngle, MIN_START_CONTROL_LENGTH, False) Then
@@ -277,12 +320,12 @@ Private Function SetSubPathStartNode(ByVal crv As Curve, ByVal subpathIndex As L
 
     On Error GoTo StartFail
 
-    Set sp = crv.Subpaths(subpathIndex)
+    Set sp = crv.SubPaths(subpathIndex)
     Set targetNode = sp.Nodes(nodeIndex)
 
     targetNode.BreakApart
 
-    Set sp = crv.Subpaths(subpathIndex)
+    Set sp = crv.SubPaths(subpathIndex)
     If Not sp.Closed Then
         On Error Resume Next
         sp.StartNode.JoinWith sp.EndNode
@@ -290,7 +333,7 @@ Private Function SetSubPathStartNode(ByVal crv As Curve, ByVal subpathIndex As L
         Err.Clear
         On Error GoTo StartFail
 
-        Set sp = crv.Subpaths(subpathIndex)
+        Set sp = crv.SubPaths(subpathIndex)
         If Not sp.Closed Then
             sp.Closed = True
         End If
@@ -298,7 +341,7 @@ Private Function SetSubPathStartNode(ByVal crv As Curve, ByVal subpathIndex As L
         joinSucceeded = True
     End If
 
-    Set sp = crv.Subpaths(subpathIndex)
+    Set sp = crv.SubPaths(subpathIndex)
     If sp.IsClockwise <> targetClockwise Then
         sp.ReverseDirection
     End If
@@ -319,7 +362,7 @@ Private Function ValidateSubPathStart(ByVal crv As Curve, ByVal subpathIndex As 
 
     On Error GoTo ValidateFail
 
-    Set sp = crv.Subpaths(subpathIndex)
+    Set sp = crv.SubPaths(subpathIndex)
     If Not sp.Closed Then Exit Function
     If sp.IsClockwise <> targetClockwise Then Exit Function
     If Not TryGetNodeOutgoingAngle(sp.StartNode, startAngle, MIN_START_CONTROL_LENGTH, False) Then Exit Function

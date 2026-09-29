@@ -1,3 +1,12 @@
+<!-- Start Point Organizer -->
+
+------------------------------------------------------------------------------------------------------------------------------------------------------
 2026-08-14
 + Menambahkan Start Point Organizer untuk menetapkan Start Point pada cutting line.
 + Menambahkan pilihan arah Clockwise dan Counter-Clockwise.
+
+------------------------------------------------------------------------------------------------------------------------------------------------------
+2026-09-29
++ Menambahkan ZOrder mandiri untuk mengurutkan objek dalam group dan subpath curve tunggal per baris, dari kiri atas ke kanan bawah.
+~ Subgroup diratakan ke group induk; curve gabungan di dalam group dengan minimal 3 subpath dipisah menjadi anggotanya, sementara curve lebih kecil tetap satu objek.
+~ Hasil ZOrder dapat dibatalkan dengan satu Undo.
