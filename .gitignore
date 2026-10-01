@@ -1,0 +1,12 @@
+# Ignore all of this files in the project directory
+*.env
+*.exe
+*.log
+*.md
+*.ps1
+
+# Include Changelog to be tracked by git
+!Changelog.log
+
+# Ignore specific files in the project directory
+StartPointWizard.bas
