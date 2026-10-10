@@ -27,7 +27,7 @@ Setiap subpath diperiksa secara terpisah:
 | 2 — Relative Handle | Node dengan segmen curve keluar | Handle keluar minimal **5% dari panjang segmen keluar**. |
 | 3 — Line Midpoint | Titik tengah segmen garis lurus | Panjang garis minimal **2 mm**. Midpoint yang sudah ada dan memenuhi syarat dapat digunakan kembali. |
 
-Satu tahap diperiksa sebelum beralih ke tahap berikutnya. Kandidat Relative Handle atau Line Midpoint hanya digunakan jika tahap sebelumnya tidak menghasilkan kandidat yang memenuhi syarat. Nilai **tepat pada ambang** tetap lolos.
+Satu tahap diperiksa sebelum beralih ke tahap berikutnya. Kandidat Relative Handle atau Line Midpoint hanya digunakan jika tahap sebelumnya tidak menghasilkan kandidat yang memenuhi syarat **dan tidak mengalami error pembacaan**. Error baca bukan bukti bahwa tahap tersebut tidak memiliki kandidat valid, sehingga fallback ke tahap lebih rendah diblokir. Nilai **tepat pada ambang** tetap lolos.
 
 Dalam setiap tahap, Start Point saat ini diperiksa lebih dahulu. Jika sudah memenuhi syarat pada tahap tersebut, posisinya dipertahankan. Jika tidak, macro mencari kandidat dengan selisih sudut keluar terkecil dari **0°**. Start Point lama yang hanya memenuhi tahap fallback masih dapat diganti jika ada kandidat pada tahap yang lebih tinggi.
 
@@ -53,15 +53,17 @@ Node baru hanya ditambahkan saat kandidat midpoint pada segmen garis benar-benar
 
 Saat dijalankan ulang, macro dapat mengenali node midpoint yang diapit dua segmen garis searah dengan panjang sama, berada di tengah kedua endpoint luar, dan mempunyai panjang gabungan minimal **2 mm**. Pemeriksaan posisi dan panjang memakai toleransi pembulatan **0,0002 mm**. Dengan demikian, midpoint yang masih memenuhi syarat dapat digunakan kembali tanpa terus menambah node.
 
-Sebelum menambah midpoint, macro menyimpan salinan curve **setelah pembalikan arah**, jika pembalikan diperlukan. Jika penambahan, pemindahan, atau validasi Start Point midpoint gagal, curve dicoba dipulihkan ke kondisi sebelum penambahan node. Pemulihan ini tidak membatalkan pembalikan arah yang sudah terjadi sebelumnya. Proses berhenti jika pemulihan gagal.
+Pembalikan arah dan pemindahan Start Point dilindungi **snapshot curve yang terpisah**. Jika pembalikan arah atau validasinya gagal, curve dicoba dipulihkan ke kondisi sebelum pembalikan. Sebelum memindahkan Start Point pada **semua tahap**, macro mengambil snapshot baru setelah arah yang diperlukan berhasil diterapkan.
+
+Jika pemindahan atau validasi Start Point gagal, curve dicoba dipulihkan ke snapshot sebelum pemindahan, termasuk membatalkan node midpoint yang baru ditambahkan. Pemulihan Start Point mempertahankan pembalikan arah yang sudah berhasil. Proses berhenti jika pemulihan gagal.
 
 ### Ringkasan dan Penanganan Error
 
-Ringkasan Organize mencakup jumlah shape dan subpath yang diperiksa, konversi, subpath terbuka, pembalikan arah, Start Point yang sudah benar atau berubah, penggunaan fallback **handle 5%** dan **midpoint garis**, No Candidate, error pembacaan kandidat, pemulihan midpoint, warning validasi, serta failure.
+Ringkasan Organize mencakup jumlah shape dan subpath yang diperiksa, konversi, subpath terbuka, pembalikan arah, Start Point yang sudah benar atau berubah, penggunaan fallback **handle 5%** dan **midpoint garis**, No Candidate, error pembacaan kandidat, warning validasi, serta failure. Counter pemulihan membedakan **pembalikan arah**, **pemindahan Start Point**, dan **midpoint**; pemulihan midpoint juga termasuk dalam counter pemulihan Start Point.
 
-Error pembacaan satu kandidat dicatat tanpa langsung menghentikan pencarian kandidat lain. Ringkasan menyertakan error kandidat pertama dan error operasi pertama jika tersedia. Error fatal, termasuk kegagalan pemulihan midpoint atau terputusnya host, menghentikan proses.
+Error pembacaan satu kandidat dicatat tanpa langsung menghentikan pencarian kandidat lain **dalam tahap yang sama**. Kandidat yang berhasil dibaca dan memenuhi syarat pada tahap itu tetap dapat dipilih. Jika tidak ditemukan kandidat valid dan ada error baca pada tahap tersebut, pencarian dihentikan tanpa turun ke tahap berikutnya; hasil dicatat sebagai pencarian tanpa hasil dengan error. Ringkasan menyertakan error kandidat pertama dan error operasi pertama jika tersedia. Error fatal, termasuk kegagalan pemulihan curve atau terputusnya host, menghentikan proses.
 
-Organize berada dalam satu `CommandGroup`. Penutupannya diperiksa, dan error operasi dibedakan dari error penutupan `CommandGroup`. Gunakan **Undo sekali** untuk membatalkan hasil operasi yang selesai dengan normal. Pemulihan otomatis yang dijelaskan di atas khusus untuk perubahan midpoint, bukan pembatalan seluruh operasi.
+Organize berada dalam satu `CommandGroup`. Penutupannya diperiksa, dan error operasi dibedakan dari error penutupan `CommandGroup`. Gunakan **Undo sekali** untuk membatalkan hasil operasi yang selesai dengan normal. Pemulihan otomatis dibatasi pada curve yang mengalami kegagalan pembalikan arah atau pemindahan Start Point; perubahan lain yang sudah berhasil dalam operasi tetap dipertahankan.
 
 ### ZOrder
 
@@ -106,7 +108,7 @@ Repository menyediakan source VBA berupa code-behind UserForm dan standard modul
 
 | Lokasi | Peran |
 | --- | --- |
-| `src/forms/StartPointMenu.vba` | Handler Organize/ZOrder, pilihan arah, pemrosesan shape dan subpath, pemulihan midpoint, ringkasan, dan callback penutupan form. |
+| `src/forms/StartPointMenu.vba` | Handler Organize/ZOrder, pilihan arah, pemrosesan shape dan subpath, snapshot serta pemulihan arah/Start Point, ringkasan, dan callback penutupan form. |
 | `src/modules/SPOStartPoint.bas` | Pencarian kandidat bertingkat, pemeriksaan handle/tangent, penambahan dan pengenalan midpoint, serta validasi kandidat. |
 | `src/modules/SPOZOrder.bas` | Pemrosesan group, pemisahan subpath yang memenuhi syarat, pengurutan Z-Order, serta pemulihan selection dan satuan. |
 | `src/modules/MRTargetBridge.bas` | Membuka UserForm dari MacroRunner melalui `OpenMacro` dan menghubungkan callback saat form ditutup. |
