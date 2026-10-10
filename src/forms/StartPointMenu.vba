@@ -5,10 +5,6 @@ Private pMRObserver As Object
 Private pMRToken As String
 
 
-Private Const ANGLE_TOLERANCE As Double = 15#
-Private Const MIN_CONTROL_LENGTH As Double = 0.000001
-Private Const MIN_START_CONTROL_LENGTH As Double = 0.5
-
 Private mFirstErrorOperation As String
 Private mFirstErrorNumber As Long
 Private mFirstErrorDescription As String
@@ -22,6 +18,8 @@ Private Type OrganizerStats
     DirectionReversed As Long
     StartAlreadyCorrect As Long
     StartChanged As Long
+    RelativeHandleStarts As Long
+    LineMidpointStarts As Long
     NoCandidateFound As Long
     ValidationWarnings As Long
     Failures As Long
@@ -38,8 +36,7 @@ Private Sub cmdOrganize_Click()
     Dim stats As OrganizerStats
     Dim targetClockwise As Boolean
     Dim commandGroupOpen As Boolean
-    Dim previousUnit As cdrUnit
-    Dim unitChanged As Boolean
+    Dim sourceUnit As cdrUnit
     Dim fatalNumber As Long
     Dim fatalDescription As String
 
@@ -75,30 +72,19 @@ Private Sub cmdOrganize_Click()
 
     targetClockwise = optClockwise.Value
 
-    On Error Resume Next
-    Err.Clear
-    previousUnit = doc.Unit
-    doc.Unit = cdrMillimeter
-    unitChanged = (Err.Number = 0)
-    Err.Clear
-    doc.BeginCommandGroup "Start Point Organizer"
-    commandGroupOpen = (Err.Number = 0)
-    Err.Clear
     On Error GoTo FatalFail
+    sourceUnit = doc.Unit
+    doc.BeginCommandGroup "Start Point Organizer"
+    commandGroupOpen = True
 
     For Each shp In selectedShapes
-        ProcessShape shp, targetClockwise, stats
+        ProcessShape shp, targetClockwise, sourceUnit, stats
     Next shp
 
 CleanExit:
     If commandGroupOpen Then
         On Error Resume Next
         doc.EndCommandGroup
-        On Error GoTo 0
-    End If
-    If unitChanged Then
-        On Error Resume Next
-        doc.Unit = previousUnit
         On Error GoTo 0
     End If
 
@@ -112,11 +98,6 @@ FatalFail:
     If commandGroupOpen Then
         On Error Resume Next
         doc.EndCommandGroup
-        On Error GoTo 0
-    End If
-    If unitChanged Then
-        On Error Resume Next
-        doc.Unit = previousUnit
         On Error GoTo 0
     End If
 
@@ -184,6 +165,7 @@ Private Sub UserForm_Initialize()
 End Sub
 
 Private Sub ProcessShape(ByVal shp As Shape, ByVal targetClockwise As Boolean, _
+                         ByVal sourceUnit As cdrUnit, _
                          ByRef stats As OrganizerStats)
     Dim childShape As Shape
     Dim crv As Curve
@@ -196,7 +178,7 @@ Private Sub ProcessShape(ByVal shp As Shape, ByVal targetClockwise As Boolean, _
 
     If shp.Type = cdrGroupShape Then
         For Each childShape In shp.Shapes
-            ProcessShape childShape, targetClockwise, stats
+            ProcessShape childShape, targetClockwise, sourceUnit, stats
         Next childShape
         Exit Sub
     End If
@@ -219,7 +201,7 @@ Private Sub ProcessShape(ByVal shp As Shape, ByVal targetClockwise As Boolean, _
 
     subpathCount = crv.SubPaths.Count
     For subpathIndex = 1 To subpathCount
-        ProcessSubPath crv, subpathIndex, targetClockwise, stats
+        ProcessSubPath crv, subpathIndex, targetClockwise, sourceUnit, stats
     Next subpathIndex
 
     Exit Sub
@@ -232,12 +214,11 @@ End Sub
 
 Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
                            ByVal targetClockwise As Boolean, _
+                           ByVal sourceUnit As cdrUnit, _
                            ByRef stats As OrganizerStats)
     Dim sp As SubPath
-    Dim startAngle As Double
-    Dim startDiff As Double
+    Dim candidate As SPOStartCandidate
     Dim candidateIndex As Long
-    Dim candidateDiff As Double
 
     On Error GoTo SubPathFail
 
@@ -255,23 +236,26 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
         Set sp = crv.SubPaths(subpathIndex)
     End If
 
-    If TryGetNodeOutgoingAngle(sp.StartNode, startAngle, MIN_START_CONTROL_LENGTH, False) Then
-        startDiff = AngleDistanceFromZero(startAngle)
-        If startDiff <= ANGLE_TOLERANCE Then
-            stats.StartAlreadyCorrect = stats.StartAlreadyCorrect + 1
-            Exit Sub
-        End If
-    End If
-
-    candidateIndex = FindBestStartCandidate(sp, candidateDiff)
-    If candidateIndex = 0 Then
+    If Not SPOFindStartCandidate(sp, sourceUnit, candidate) Then
         stats.NoCandidateFound = stats.NoCandidateFound + 1
         Exit Sub
     End If
 
+    If candidate.SegmentIndex = 0 And candidate.NodeIndex = sp.StartNode.Index Then
+        stats.StartAlreadyCorrect = stats.StartAlreadyCorrect + 1
+        Exit Sub
+    End If
+
+    candidateIndex = SPOMaterializeStartCandidate(crv, subpathIndex, candidate)
     If SetSubPathStartNode(crv, subpathIndex, candidateIndex, targetClockwise) Then
         stats.StartChanged = stats.StartChanged + 1
-        If Not ValidateSubPathStart(crv, subpathIndex, targetClockwise) Then
+        Select Case candidate.Tier
+            Case spoStartRelativeHandle
+                stats.RelativeHandleStarts = stats.RelativeHandleStarts + 1
+            Case spoStartLineMidpoint
+                stats.LineMidpointStarts = stats.LineMidpointStarts + 1
+        End Select
+        If Not ValidateSubPathStart(crv, subpathIndex, targetClockwise, sourceUnit, candidate) Then
             stats.ValidationWarnings = stats.ValidationWarnings + 1
         End If
     Else
@@ -285,31 +269,6 @@ SubPathFail:
     stats.Failures = stats.Failures + 1
     Err.Clear
 End Sub
-
-Private Function FindBestStartCandidate(ByVal sp As SubPath, _
-                                        ByRef bestDiff As Double) As Long
-    Dim n As Node
-    Dim nodeAngle As Double
-    Dim diff As Double
-    Dim bestIndex As Long
-
-    bestDiff = ANGLE_TOLERANCE + 1#
-    bestIndex = 0
-
-    For Each n In sp.Nodes
-        If TryGetNodeOutgoingAngle(n, nodeAngle, MIN_START_CONTROL_LENGTH, False) Then
-            diff = AngleDistanceFromZero(nodeAngle)
-            If diff <= ANGLE_TOLERANCE Then
-                If bestIndex = 0 Or diff < bestDiff Then
-                    bestIndex = n.Index
-                    bestDiff = diff
-                End If
-            End If
-        End If
-    Next n
-
-    FindBestStartCandidate = bestIndex
-End Function
 
 Private Function SetSubPathStartNode(ByVal crv As Curve, ByVal subpathIndex As Long, _
                                      ByVal nodeIndex As Long, _
@@ -356,129 +315,21 @@ StartFail:
 End Function
 
 Private Function ValidateSubPathStart(ByVal crv As Curve, ByVal subpathIndex As Long, _
-                                      ByVal targetClockwise As Boolean) As Boolean
+                                      ByVal targetClockwise As Boolean, ByVal sourceUnit As cdrUnit, _
+                                      ByRef candidate As SPOStartCandidate) As Boolean
     Dim sp As SubPath
-    Dim startAngle As Double
 
     On Error GoTo ValidateFail
 
     Set sp = crv.SubPaths(subpathIndex)
     If Not sp.Closed Then Exit Function
     If sp.IsClockwise <> targetClockwise Then Exit Function
-    If Not TryGetNodeOutgoingAngle(sp.StartNode, startAngle, MIN_START_CONTROL_LENGTH, False) Then Exit Function
-
-    ValidateSubPathStart = (AngleDistanceFromZero(startAngle) <= ANGLE_TOLERANCE)
+    ValidateSubPathStart = SPOValidateStartCandidate(sp, sourceUnit, candidate)
     Exit Function
 
 ValidateFail:
     SaveFirstError "ValidateSubPathStart"
     Err.Clear
-End Function
-
-Private Function TryGetNodeOutgoingAngle(ByVal n As Node, _
-                                         ByRef angleValue As Double, _
-                                         Optional ByVal minControlLength As Double = MIN_CONTROL_LENGTH, _
-                                         Optional ByVal allowFallback As Boolean = True) As Boolean
-    Dim seg As Segment
-
-    On Error GoTo AngleFail
-
-    Set seg = n.NextSegment
-    If Not seg Is Nothing Then
-        If seg.Type = cdrCurveSegment Then
-            If Abs(seg.StartingControlPointLength) >= minControlLength Then
-                angleValue = NormalizeAngle(seg.StartingControlPointAngle)
-                TryGetNodeOutgoingAngle = True
-                Exit Function
-            End If
-        End If
-    End If
-
-    If allowFallback Then
-        TryGetNodeOutgoingAngle = TryGetAngleToNextNode(n, angleValue)
-    Else
-        TryGetNodeOutgoingAngle = False
-    End If
-    Exit Function
-
-AngleFail:
-    SaveFirstError "TryGetNodeOutgoingAngle / NextSegment / control point"
-    Err.Clear
-    TryGetNodeOutgoingAngle = False
-End Function
-
-Private Function TryGetAngleToNextNode(ByVal n As Node, _
-                                       ByRef angleValue As Double) As Boolean
-    Dim nextNode As Node
-    Dim dx As Double
-    Dim dy As Double
-
-    On Error GoTo AngleFail
-
-    Set nextNode = n.Next
-    If nextNode Is Nothing Then
-        If n.SubPath.Closed Then Set nextNode = n.SubPath.StartNode
-    End If
-
-    If nextNode Is Nothing Then Exit Function
-
-    dx = nextNode.PositionX - n.PositionX
-    dy = nextNode.PositionY - n.PositionY
-
-    If Abs(dx) <= MIN_CONTROL_LENGTH And Abs(dy) <= MIN_CONTROL_LENGTH Then
-        Exit Function
-    End If
-
-    angleValue = NormalizeAngle(Atan2Degrees(dy, dx))
-    TryGetAngleToNextNode = True
-    Exit Function
-
-AngleFail:
-    SaveFirstError "TryGetAngleToNextNode / node position fallback"
-    Err.Clear
-End Function
-
-Private Function AngleDistanceFromZero(ByVal angleValue As Double) As Double
-    Dim normalizedAngle As Double
-
-    normalizedAngle = NormalizeAngle(angleValue)
-    If normalizedAngle > 180# Then
-        AngleDistanceFromZero = 360# - normalizedAngle
-    Else
-        AngleDistanceFromZero = normalizedAngle
-    End If
-End Function
-
-Private Function NormalizeAngle(ByVal angleValue As Double) As Double
-    Do While angleValue < 0#
-        angleValue = angleValue + 360#
-    Loop
-
-    Do While angleValue >= 360#
-        angleValue = angleValue - 360#
-    Loop
-
-    NormalizeAngle = angleValue
-End Function
-
-Private Function Atan2Degrees(ByVal y As Double, ByVal x As Double) As Double
-    Const PI As Double = 3.14159265358979
-    Dim angleRadians As Double
-
-    If Abs(x) <= MIN_CONTROL_LENGTH Then
-        If y >= 0# Then
-            angleRadians = PI / 2#
-        Else
-            angleRadians = -PI / 2#
-        End If
-    Else
-        angleRadians = Atn(y / x)
-        If x < 0# Then
-            angleRadians = angleRadians + PI
-        End If
-    End If
-
-    Atan2Degrees = angleRadians * 180# / PI
 End Function
 
 Private Function BuildSummary(ByRef stats As OrganizerStats) As String
@@ -491,6 +342,8 @@ Private Function BuildSummary(ByRef stats As OrganizerStats) As String
         "Arah subpath dibalik: " & stats.DirectionReversed & vbCrLf & _
         "Start point sudah benar: " & stats.StartAlreadyCorrect & vbCrLf & _
         "Start point diubah: " & stats.StartChanged & vbCrLf & _
+        "Start point diubah via handle 5%: " & stats.RelativeHandleStarts & vbCrLf & _
+        "Start point diubah via midpoint garis: " & stats.LineMidpointStarts & vbCrLf & _
         "Tidak ada kandidat 0 +/- 15 derajat: " & stats.NoCandidateFound & vbCrLf & _
         "Warning validasi: " & stats.ValidationWarnings & vbCrLf & _
         "Failure: " & stats.Failures
