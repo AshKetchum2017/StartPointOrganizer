@@ -6,6 +6,7 @@ Private pMRToken As String
 
 Private Const ERR_START_FAILED As Long = vbObjectError + 5121
 Private Const ERR_START_VALIDATION_FAILED As Long = vbObjectError + 5122
+Private Const ERR_DIRECTION_FAILED As Long = vbObjectError + 5123
 
 Private mFirstErrorOperation As String
 Private mFirstErrorNumber As Long
@@ -27,6 +28,8 @@ Private Type OrganizerStats
     NoCandidateFound As Long
     CandidateReadErrors As Long
     IncompleteSearches As Long
+    DirectionRollbacks As Long
+    StartRollbacks As Long
     MidpointRollbacks As Long
     ValidationWarnings As Long
     Failures As Long
@@ -272,8 +275,10 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
     Dim diagnostics As SPOCandidateDiagnostics
     Dim diagnosticsRecorded As Boolean
     Dim found As Boolean
-    Dim midpointBackup As Curve
-    Dim midpointPending As Boolean
+    Dim mutationBackup As Curve
+    Dim mutationPending As Boolean
+    Dim mutationOperation As String
+    Dim insertsMidpoint As Boolean
     Dim startValid As Boolean
     Dim errorNumber As Long
     Dim errorSource As String
@@ -293,9 +298,18 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
     End If
 
     If sp.IsClockwise <> targetClockwise Then
+        mutationOperation = "pembalikan arah"
+        Set mutationBackup = crv.GetCopy
+        If mutationBackup Is Nothing Then Err.Raise ERR_DIRECTION_FAILED, "ProcessSubPath", "Backup arah tidak tersedia."
+        mutationPending = True
         sp.ReverseDirection
-        stats.DirectionReversed = stats.DirectionReversed + 1
         Set sp = crv.SubPaths(subpathIndex)
+        If Not sp.Closed Or sp.IsClockwise <> targetClockwise Then
+            Err.Raise ERR_DIRECTION_FAILED, "ProcessSubPath", "Validasi pembalikan arah gagal."
+        End If
+        mutationPending = False
+        Set mutationBackup = Nothing
+        stats.DirectionReversed = stats.DirectionReversed + 1
     End If
 
     found = SPOFindStartCandidate(sp, sourceUnit, candidate, diagnostics)
@@ -315,26 +329,25 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
         Exit Sub
     End If
 
-    If candidate.SegmentIndex > 0 Then
-        ' Snapshot setelah ReverseDirection, tepat sebelum penambahan midpoint.
-        Set midpointBackup = crv.GetCopy
-        If midpointBackup Is Nothing Then Err.Raise ERR_START_FAILED, "ProcessSubPath", "Backup midpoint tidak tersedia."
-        midpointPending = True
-    End If
+    ' Transaksi startpoint terpisah dari arah yang sudah berhasil diterapkan.
+    mutationOperation = "pemindahan startpoint"
+    insertsMidpoint = (candidate.SegmentIndex > 0)
+    Set mutationBackup = crv.GetCopy
+    If mutationBackup Is Nothing Then Err.Raise ERR_START_FAILED, "ProcessSubPath", "Backup startpoint tidak tersedia."
+    mutationPending = True
 
     candidateIndex = SPOMaterializeStartCandidate(crv, subpathIndex, candidate)
     If Not SetSubPathStartNode(crv, subpathIndex, candidateIndex, targetClockwise) Then
-        If midpointPending Then Err.Raise ERR_START_FAILED, "ProcessSubPath", "Pemindahan startpoint midpoint gagal."
-        stats.Failures = stats.Failures + 1
-        Exit Sub
+        Err.Raise ERR_START_FAILED, "ProcessSubPath", "Pemindahan startpoint gagal."
     End If
 
     startValid = ValidateSubPathStart(crv, subpathIndex, targetClockwise, sourceUnit, candidate)
     If Not startValid Then
         stats.ValidationWarnings = stats.ValidationWarnings + 1
-        If midpointPending Then Err.Raise ERR_START_VALIDATION_FAILED, "ProcessSubPath", "Validasi startpoint midpoint gagal."
+        Err.Raise ERR_START_VALIDATION_FAILED, "ProcessSubPath", "Validasi startpoint gagal."
     End If
-    midpointPending = False
+    mutationPending = False
+    Set mutationBackup = Nothing
     stats.StartChanged = stats.StartChanged + 1
     Select Case candidate.Tier
         Case spoStartRelativeHandle
@@ -350,16 +363,21 @@ SubPathFail:
     errorDescription = Err.Description
     SaveFirstError "ProcessSubPath / direction / candidate processing"
     If Not diagnosticsRecorded Then RecordCandidateDiagnostics stats, diagnostics
-    If midpointPending Then
+    If mutationPending Then
         ' Pemulihan dibatasi pada curve ini; tidak memanggil Undo dokumen.
-        If Not TryRestoreMidpointCurve(crv, midpointBackup, subpathIndex, _
+        If Not TryRestoreCurve(crv, mutationBackup, subpathIndex, _
                                       restoreNumber, restoreSource, restoreDescription) Then
-            Err.Raise SPO_ERR_ROLLBACK_FAILED, "ProcessSubPath / rollback midpoint", _
+            Err.Raise SPO_ERR_ROLLBACK_FAILED, "ProcessSubPath / rollback " & mutationOperation, _
                       "Operasi awal: " & errorNumber & " / " & errorSource & " / " & errorDescription & vbCrLf & _
                       "Pemulihan: " & restoreNumber & " / " & restoreSource & " / " & restoreDescription
         End If
-        midpointPending = False
-        stats.MidpointRollbacks = stats.MidpointRollbacks + 1
+        mutationPending = False
+        If mutationOperation = "pembalikan arah" Then
+            stats.DirectionRollbacks = stats.DirectionRollbacks + 1
+        Else
+            stats.StartRollbacks = stats.StartRollbacks + 1
+            If insertsMidpoint Then stats.MidpointRollbacks = stats.MidpointRollbacks + 1
+        End If
     End If
     If SPOIsFatalError(errorNumber) Then Err.Raise errorNumber, errorSource, errorDescription
     stats.Failures = stats.Failures + 1
@@ -375,7 +393,7 @@ Private Sub RecordCandidateDiagnostics(ByRef stats As OrganizerStats, ByRef diag
                            "Err.Description: " & diagnostics.FirstDescription
 End Sub
 
-Private Function TryRestoreMidpointCurve(ByVal crv As Curve, ByVal backup As Curve, _
+Private Function TryRestoreCurve(ByVal crv As Curve, ByVal backup As Curve, _
                                          ByVal subpathIndex As Long, ByRef errorNumber As Long, _
                                          ByRef errorSource As String, ByRef errorDescription As String) As Boolean
     Dim restored As SubPath
@@ -385,12 +403,12 @@ Private Function TryRestoreMidpointCurve(ByVal crv As Curve, ByVal backup As Cur
     Set restored = crv.SubPaths(subpathIndex)
     Set original = backup.SubPaths(subpathIndex)
     If crv.SubPaths.Count <> backup.SubPaths.Count Or crv.Nodes.Count <> backup.Nodes.Count Then
-        Err.Raise SPO_ERR_ROLLBACK_FAILED, "TryRestoreMidpointCurve", "Jumlah subpath/node setelah pemulihan tidak sesuai."
+        Err.Raise SPO_ERR_ROLLBACK_FAILED, "TryRestoreCurve", "Jumlah subpath/node setelah pemulihan tidak sesuai."
     End If
     If restored.Closed <> original.Closed Or restored.IsClockwise <> original.IsClockwise Then
-        Err.Raise SPO_ERR_ROLLBACK_FAILED, "TryRestoreMidpointCurve", "Status closed/arah setelah pemulihan tidak sesuai."
+        Err.Raise SPO_ERR_ROLLBACK_FAILED, "TryRestoreCurve", "Status closed/arah setelah pemulihan tidak sesuai."
     End If
-    TryRestoreMidpointCurve = True
+    TryRestoreCurve = True
     Exit Function
 RestoreFailed:
     errorNumber = Err.Number
@@ -487,6 +505,8 @@ Private Function BuildSummary(ByRef stats As OrganizerStats) As String
         "Tidak ada kandidat 0 +/- 15 derajat: " & stats.NoCandidateFound & vbCrLf & _
         "Pencarian tanpa hasil dengan error pembacaan: " & stats.IncompleteSearches & vbCrLf & _
         "Percobaan baca kandidat gagal: " & stats.CandidateReadErrors & vbCrLf & _
+        "Pembalikan arah dipulihkan: " & stats.DirectionRollbacks & vbCrLf & _
+        "Pemindahan startpoint dipulihkan: " & stats.StartRollbacks & vbCrLf & _
         "Midpoint dipulihkan: " & stats.MidpointRollbacks & vbCrLf & _
         "Warning validasi: " & stats.ValidationWarnings & vbCrLf & _
         "Failure: " & stats.Failures

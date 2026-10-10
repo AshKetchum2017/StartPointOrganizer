@@ -52,6 +52,7 @@ Public Function SPOFindStartCandidate(ByVal sp As SubPath, ByVal sourceUnit As c
     Dim itemIndex As Long
     Dim trial As SPOStartCandidate
     Dim mmPerUnit As Double
+    Dim readErrorsBeforeTier As Long
 
     candidate.Tier = spoStartNone
     candidate.NodeIndex = 0
@@ -71,6 +72,7 @@ Public Function SPOFindStartCandidate(ByVal sp As SubPath, ByVal sourceUnit As c
     ' Selesaikan satu tingkatan secara utuh sebelum mempertimbangkan tingkatan berikutnya.
     ' Temuan awal yang hanya memenuhi syarat 5% tidak boleh menutupi kandidat berukuran 0,5 mm di tempat lain.
     For tier = spoStartFixedHandle To spoStartLineMidpoint
+        readErrorsBeforeTier = diagnostics.ReadErrors
         If TryReadNodeCandidate(sp, 0, tier, mmPerUnit, trial, diagnostics) = spoCandidateEligible Then
             CopyCandidate candidate, trial
             SPOFindStartCandidate = True
@@ -99,6 +101,9 @@ Public Function SPOFindStartCandidate(ByVal sp As SubPath, ByVal sourceUnit As c
             SPOFindStartCandidate = True
             Exit Function
         End If
+        ' Error baca bukan bukti bahwa tier ini tidak memiliki kandidat valid.
+        ' Tetap cari kandidat sehat dalam tier yang sama, tetapi jangan turun tier.
+        If diagnostics.ReadErrors > readErrorsBeforeTier Then Exit Function
     Next tier
 End Function
 
