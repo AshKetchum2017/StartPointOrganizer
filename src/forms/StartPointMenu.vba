@@ -4,10 +4,14 @@ Option Explicit
 Private pMRObserver As Object
 Private pMRToken As String
 
+Private Const ERR_START_FAILED As Long = vbObjectError + 5121
+Private Const ERR_START_VALIDATION_FAILED As Long = vbObjectError + 5122
 
 Private mFirstErrorOperation As String
 Private mFirstErrorNumber As Long
+Private mFirstErrorSource As String
 Private mFirstErrorDescription As String
+Private mFirstCandidateError As String
 
 Private Type OrganizerStats
     ShapesSeen As Long
@@ -21,6 +25,9 @@ Private Type OrganizerStats
     RelativeHandleStarts As Long
     LineMidpointStarts As Long
     NoCandidateFound As Long
+    CandidateReadErrors As Long
+    IncompleteSearches As Long
+    MidpointRollbacks As Long
     ValidationWarnings As Long
     Failures As Long
 End Type
@@ -38,7 +45,13 @@ Private Sub cmdOrganize_Click()
     Dim commandGroupOpen As Boolean
     Dim sourceUnit As cdrUnit
     Dim fatalNumber As Long
+    Dim fatalSource As String
     Dim fatalDescription As String
+    Dim closeNumber As Long
+    Dim closeSource As String
+    Dim closeDescription As String
+    Dim messageText As String
+    Dim messageStyle As VbMsgBoxStyle
 
     ClearFirstError
 
@@ -80,32 +93,61 @@ Private Sub cmdOrganize_Click()
     For Each shp In selectedShapes
         ProcessShape shp, targetClockwise, sourceUnit, stats
     Next shp
-
-CleanExit:
-    If commandGroupOpen Then
-        On Error Resume Next
-        doc.EndCommandGroup
-        On Error GoTo 0
-    End If
-
-    ShowMessageAfterClose BuildSummary(stats), vbInformation
-    Exit Sub
+    GoTo CleanExit
 
 FatalFail:
     fatalNumber = Err.Number
+    fatalSource = Err.Source
     fatalDescription = Err.Description
+    SaveFirstError "cmdOrganize / eksekusi"
     stats.Failures = stats.Failures + 1
-    If commandGroupOpen Then
-        On Error Resume Next
-        doc.EndCommandGroup
-        On Error GoTo 0
+    Resume CleanExit
+
+CleanExit:
+    On Error GoTo 0
+    If Not TryEndOrganizerCommandGroup(doc, commandGroupOpen, closeNumber, closeSource, closeDescription) Then
+        messageText = "Penutupan CommandGroup gagal." & vbCrLf & _
+                      "Err.Number: " & closeNumber & vbCrLf & _
+                      "Err.Source: " & closeSource & vbCrLf & _
+                      "Err.Description: " & closeDescription
     End If
 
-    ShowMessageAfterClose "Macro berhenti karena error." & vbCrLf & _
-                          "Err.Number: " & fatalNumber & vbCrLf & _
-                          "Err.Description: " & fatalDescription & vbCrLf & vbCrLf & _
-                          BuildSummary(stats), vbCritical
+    If fatalNumber <> 0 Then
+        If Len(messageText) > 0 Then messageText = vbCrLf & vbCrLf & messageText
+        messageText = "Macro berhenti karena error." & vbCrLf & _
+                      "Err.Number: " & fatalNumber & vbCrLf & _
+                      "Err.Source: " & fatalSource & vbCrLf & _
+                      "Err.Description: " & fatalDescription & messageText
+    End If
+
+    messageStyle = vbInformation
+    If fatalNumber <> 0 Or closeNumber <> 0 Then
+        messageStyle = vbCritical
+    ElseIf stats.Failures > 0 Or stats.ValidationWarnings > 0 Or stats.CandidateReadErrors > 0 Then
+        messageText = "Selesai dengan catatan."
+        messageStyle = vbExclamation
+    Else
+        messageText = "Selesai."
+    End If
+    ShowMessageAfterClose messageText & vbCrLf & vbCrLf & BuildSummary(stats), messageStyle
 End Sub
+
+Private Function TryEndOrganizerCommandGroup(ByVal doc As Document, ByRef groupOpen As Boolean, _
+                                             ByRef errorNumber As Long, ByRef errorSource As String, _
+                                             ByRef errorDescription As String) As Boolean
+    On Error GoTo CloseFailed
+    If groupOpen Then
+        doc.EndCommandGroup
+        groupOpen = False
+    End If
+    TryEndOrganizerCommandGroup = True
+    Exit Function
+CloseFailed:
+    errorNumber = Err.Number
+    errorSource = Err.Source
+    errorDescription = Err.Description
+    Err.Clear
+End Function
 
 ' Kontrol ini sengaja menumpang sementara di SPO
 Private Sub cmdZOrder_Click()
@@ -171,6 +213,9 @@ Private Sub ProcessShape(ByVal shp As Shape, ByVal targetClockwise As Boolean, _
     Dim crv As Curve
     Dim subpathCount As Long
     Dim subpathIndex As Long
+    Dim errorNumber As Long
+    Dim errorSource As String
+    Dim errorDescription As String
 
     On Error GoTo ShapeFail
 
@@ -201,13 +246,18 @@ Private Sub ProcessShape(ByVal shp As Shape, ByVal targetClockwise As Boolean, _
 
     subpathCount = crv.SubPaths.Count
     For subpathIndex = 1 To subpathCount
+        Set crv = shp.Curve
         ProcessSubPath crv, subpathIndex, targetClockwise, sourceUnit, stats
     Next subpathIndex
 
     Exit Sub
 
 ShapeFail:
+    errorNumber = Err.Number
+    errorSource = Err.Source
+    errorDescription = Err.Description
     SaveFirstError "ProcessShape / ConvertToCurves / Curve access"
+    If SPOIsFatalError(errorNumber) Then Err.Raise errorNumber, errorSource, errorDescription
     stats.Failures = stats.Failures + 1
     Err.Clear
 End Sub
@@ -219,6 +269,18 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
     Dim sp As SubPath
     Dim candidate As SPOStartCandidate
     Dim candidateIndex As Long
+    Dim diagnostics As SPOCandidateDiagnostics
+    Dim diagnosticsRecorded As Boolean
+    Dim found As Boolean
+    Dim midpointBackup As Curve
+    Dim midpointPending As Boolean
+    Dim startValid As Boolean
+    Dim errorNumber As Long
+    Dim errorSource As String
+    Dim errorDescription As String
+    Dim restoreNumber As Long
+    Dim restoreSource As String
+    Dim restoreDescription As String
 
     On Error GoTo SubPathFail
 
@@ -236,46 +298,115 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
         Set sp = crv.SubPaths(subpathIndex)
     End If
 
-    If Not SPOFindStartCandidate(sp, sourceUnit, candidate) Then
-        stats.NoCandidateFound = stats.NoCandidateFound + 1
+    found = SPOFindStartCandidate(sp, sourceUnit, candidate, diagnostics)
+    RecordCandidateDiagnostics stats, diagnostics
+    diagnosticsRecorded = True
+    If Not found Then
+        If diagnostics.ReadErrors > 0 Then
+            stats.IncompleteSearches = stats.IncompleteSearches + 1
+        Else
+            stats.NoCandidateFound = stats.NoCandidateFound + 1
+        End If
         Exit Sub
     End If
 
-    If candidate.SegmentIndex = 0 And candidate.NodeIndex = sp.StartNode.Index Then
+    If candidate.IsCurrentStart Then
         stats.StartAlreadyCorrect = stats.StartAlreadyCorrect + 1
         Exit Sub
     End If
 
-    candidateIndex = SPOMaterializeStartCandidate(crv, subpathIndex, candidate)
-    If SetSubPathStartNode(crv, subpathIndex, candidateIndex, targetClockwise) Then
-        stats.StartChanged = stats.StartChanged + 1
-        Select Case candidate.Tier
-            Case spoStartRelativeHandle
-                stats.RelativeHandleStarts = stats.RelativeHandleStarts + 1
-            Case spoStartLineMidpoint
-                stats.LineMidpointStarts = stats.LineMidpointStarts + 1
-        End Select
-        If Not ValidateSubPathStart(crv, subpathIndex, targetClockwise, sourceUnit, candidate) Then
-            stats.ValidationWarnings = stats.ValidationWarnings + 1
-        End If
-    Else
-        stats.Failures = stats.Failures + 1
+    If candidate.SegmentIndex > 0 Then
+        ' Snapshot setelah ReverseDirection, tepat sebelum penambahan midpoint.
+        Set midpointBackup = crv.GetCopy
+        If midpointBackup Is Nothing Then Err.Raise ERR_START_FAILED, "ProcessSubPath", "Backup midpoint tidak tersedia."
+        midpointPending = True
     End If
 
+    candidateIndex = SPOMaterializeStartCandidate(crv, subpathIndex, candidate)
+    If Not SetSubPathStartNode(crv, subpathIndex, candidateIndex, targetClockwise) Then
+        If midpointPending Then Err.Raise ERR_START_FAILED, "ProcessSubPath", "Pemindahan startpoint midpoint gagal."
+        stats.Failures = stats.Failures + 1
+        Exit Sub
+    End If
+
+    startValid = ValidateSubPathStart(crv, subpathIndex, targetClockwise, sourceUnit, candidate)
+    If Not startValid Then
+        stats.ValidationWarnings = stats.ValidationWarnings + 1
+        If midpointPending Then Err.Raise ERR_START_VALIDATION_FAILED, "ProcessSubPath", "Validasi startpoint midpoint gagal."
+    End If
+    midpointPending = False
+    stats.StartChanged = stats.StartChanged + 1
+    Select Case candidate.Tier
+        Case spoStartRelativeHandle
+            stats.RelativeHandleStarts = stats.RelativeHandleStarts + 1
+        Case spoStartLineMidpoint
+            stats.LineMidpointStarts = stats.LineMidpointStarts + 1
+    End Select
     Exit Sub
 
 SubPathFail:
+    errorNumber = Err.Number
+    errorSource = Err.Source
+    errorDescription = Err.Description
     SaveFirstError "ProcessSubPath / direction / candidate processing"
+    If Not diagnosticsRecorded Then RecordCandidateDiagnostics stats, diagnostics
+    If midpointPending Then
+        ' Pemulihan dibatasi pada curve ini; tidak memanggil Undo dokumen.
+        If Not TryRestoreMidpointCurve(crv, midpointBackup, subpathIndex, _
+                                      restoreNumber, restoreSource, restoreDescription) Then
+            Err.Raise SPO_ERR_ROLLBACK_FAILED, "ProcessSubPath / rollback midpoint", _
+                      "Operasi awal: " & errorNumber & " / " & errorSource & " / " & errorDescription & vbCrLf & _
+                      "Pemulihan: " & restoreNumber & " / " & restoreSource & " / " & restoreDescription
+        End If
+        midpointPending = False
+        stats.MidpointRollbacks = stats.MidpointRollbacks + 1
+    End If
+    If SPOIsFatalError(errorNumber) Then Err.Raise errorNumber, errorSource, errorDescription
     stats.Failures = stats.Failures + 1
     Err.Clear
 End Sub
+
+Private Sub RecordCandidateDiagnostics(ByRef stats As OrganizerStats, ByRef diagnostics As SPOCandidateDiagnostics)
+    stats.CandidateReadErrors = stats.CandidateReadErrors + diagnostics.ReadErrors
+    If diagnostics.ReadErrors = 0 Or Len(mFirstCandidateError) > 0 Then Exit Sub
+    mFirstCandidateError = "Pembacaan kandidat pertama yang gagal: " & diagnostics.FirstOperation & vbCrLf & _
+                           "Err.Number: " & diagnostics.FirstNumber & vbCrLf & _
+                           "Err.Source: " & diagnostics.FirstSource & vbCrLf & _
+                           "Err.Description: " & diagnostics.FirstDescription
+End Sub
+
+Private Function TryRestoreMidpointCurve(ByVal crv As Curve, ByVal backup As Curve, _
+                                         ByVal subpathIndex As Long, ByRef errorNumber As Long, _
+                                         ByRef errorSource As String, ByRef errorDescription As String) As Boolean
+    Dim restored As SubPath
+    Dim original As SubPath
+    On Error GoTo RestoreFailed
+    crv.CopyAssign backup
+    Set restored = crv.SubPaths(subpathIndex)
+    Set original = backup.SubPaths(subpathIndex)
+    If crv.SubPaths.Count <> backup.SubPaths.Count Or crv.Nodes.Count <> backup.Nodes.Count Then
+        Err.Raise SPO_ERR_ROLLBACK_FAILED, "TryRestoreMidpointCurve", "Jumlah subpath/node setelah pemulihan tidak sesuai."
+    End If
+    If restored.Closed <> original.Closed Or restored.IsClockwise <> original.IsClockwise Then
+        Err.Raise SPO_ERR_ROLLBACK_FAILED, "TryRestoreMidpointCurve", "Status closed/arah setelah pemulihan tidak sesuai."
+    End If
+    TryRestoreMidpointCurve = True
+    Exit Function
+RestoreFailed:
+    errorNumber = Err.Number
+    errorSource = Err.Source
+    errorDescription = Err.Description
+    Err.Clear
+End Function
 
 Private Function SetSubPathStartNode(ByVal crv As Curve, ByVal subpathIndex As Long, _
                                      ByVal nodeIndex As Long, _
                                      ByVal targetClockwise As Boolean) As Boolean
     Dim sp As SubPath
     Dim targetNode As Node
-    Dim joinSucceeded As Boolean
+    Dim errorNumber As Long
+    Dim errorSource As String
+    Dim errorDescription As String
 
     On Error GoTo StartFail
 
@@ -288,16 +419,17 @@ Private Function SetSubPathStartNode(ByVal crv As Curve, ByVal subpathIndex As L
     If Not sp.Closed Then
         On Error Resume Next
         sp.StartNode.JoinWith sp.EndNode
-        joinSucceeded = (Err.Number = 0)
+        errorNumber = Err.Number
+        errorSource = Err.Source
+        errorDescription = Err.Description
         Err.Clear
         On Error GoTo StartFail
+        If SPOIsFatalError(errorNumber) Then Err.Raise errorNumber, errorSource, errorDescription
 
         Set sp = crv.SubPaths(subpathIndex)
         If Not sp.Closed Then
             sp.Closed = True
         End If
-    Else
-        joinSucceeded = True
     End If
 
     Set sp = crv.SubPaths(subpathIndex)
@@ -305,19 +437,24 @@ Private Function SetSubPathStartNode(ByVal crv As Curve, ByVal subpathIndex As L
         sp.ReverseDirection
     End If
 
-    SetSubPathStartNode = joinSucceeded Or sp.Closed
+    SetSubPathStartNode = sp.Closed And (sp.IsClockwise = targetClockwise)
     Exit Function
 
 StartFail:
+    errorNumber = Err.Number
+    errorSource = Err.Source
+    errorDescription = Err.Description
     SaveFirstError "SetSubPathStartNode / BreakApart / JoinWith / Close"
-    Err.Clear
-    SetSubPathStartNode = False
+    Err.Raise errorNumber, errorSource, errorDescription
 End Function
 
 Private Function ValidateSubPathStart(ByVal crv As Curve, ByVal subpathIndex As Long, _
                                       ByVal targetClockwise As Boolean, ByVal sourceUnit As cdrUnit, _
                                       ByRef candidate As SPOStartCandidate) As Boolean
     Dim sp As SubPath
+    Dim errorNumber As Long
+    Dim errorSource As String
+    Dim errorDescription As String
 
     On Error GoTo ValidateFail
 
@@ -328,12 +465,15 @@ Private Function ValidateSubPathStart(ByVal crv As Curve, ByVal subpathIndex As 
     Exit Function
 
 ValidateFail:
+    errorNumber = Err.Number
+    errorSource = Err.Source
+    errorDescription = Err.Description
     SaveFirstError "ValidateSubPathStart"
-    Err.Clear
+    Err.Raise errorNumber, errorSource, errorDescription
 End Function
 
 Private Function BuildSummary(ByRef stats As OrganizerStats) As String
-    BuildSummary = "Selesai." & vbCrLf & _
+    BuildSummary = "Ringkasan:" & vbCrLf & _
         "Shape dicek: " & stats.ShapesSeen & vbCrLf & _
         "Shape dikonversi ke curve: " & stats.ShapesConverted & vbCrLf & _
         "Shape non-curve diabaikan: " & stats.NonCurveSkipped & vbCrLf & _
@@ -345,6 +485,9 @@ Private Function BuildSummary(ByRef stats As OrganizerStats) As String
         "Start point diubah via handle 5%: " & stats.RelativeHandleStarts & vbCrLf & _
         "Start point diubah via midpoint garis: " & stats.LineMidpointStarts & vbCrLf & _
         "Tidak ada kandidat 0 +/- 15 derajat: " & stats.NoCandidateFound & vbCrLf & _
+        "Pencarian tanpa hasil dengan error pembacaan: " & stats.IncompleteSearches & vbCrLf & _
+        "Percobaan baca kandidat gagal: " & stats.CandidateReadErrors & vbCrLf & _
+        "Midpoint dipulihkan: " & stats.MidpointRollbacks & vbCrLf & _
         "Warning validasi: " & stats.ValidationWarnings & vbCrLf & _
         "Failure: " & stats.Failures
 
@@ -352,14 +495,18 @@ Private Function BuildSummary(ByRef stats As OrganizerStats) As String
         BuildSummary = BuildSummary & vbCrLf & vbCrLf & _
             "First error operation: " & mFirstErrorOperation & vbCrLf & _
             "Err.Number: " & mFirstErrorNumber & vbCrLf & _
+            "Err.Source: " & mFirstErrorSource & vbCrLf & _
             "Err.Description: " & mFirstErrorDescription
     End If
+    If Len(mFirstCandidateError) > 0 Then BuildSummary = BuildSummary & vbCrLf & vbCrLf & mFirstCandidateError
 End Function
 
 Private Sub ClearFirstError()
     mFirstErrorOperation = ""
     mFirstErrorNumber = 0
+    mFirstErrorSource = ""
     mFirstErrorDescription = ""
+    mFirstCandidateError = ""
 End Sub
 
 Private Sub SaveFirstError(ByVal operationName As String)
@@ -368,6 +515,7 @@ Private Sub SaveFirstError(ByVal operationName As String)
 
     mFirstErrorOperation = operationName
     mFirstErrorNumber = Err.Number
+    mFirstErrorSource = Err.Source
     mFirstErrorDescription = Err.Description
 End Sub
 
