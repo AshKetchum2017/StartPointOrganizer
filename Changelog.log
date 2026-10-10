@@ -14,3 +14,6 @@
 + Menambahkan fallback berurutan: handle minimal 0.5 mm, handle minimal 5% panjang segment di sisi handle, lalu midpoint garis lurus minimal 2 mm. Nilai tepat pada batas tetap lolos.
 ~ Pemilihan Start Point kini memeriksa tangent masuk dan keluar dengan selisih maksimal 15 derajat untuk menghindari cusp buruk.
 ~ Midpoint dikenali kembali saat SPO dijalankan ulang agar tidak terus menambah node. Uji curve custom berukuran 5 x 5 sampai 150 x 150 mm sesuai aturan; Undo tetap aman.
+~ Error pembacaan satu kandidat kini dicatat tanpa menghentikan pencarian kandidat lain.
+~ Kegagalan pengolahan midpoint memulihkan curve ke kondisi sebelum penambahan node; proses berhenti jika pemulihan gagal.
+~ Penutupan CommandGroup diperiksa, dengan pemberitahuan terpisah untuk error operasi dan error cleanup.
