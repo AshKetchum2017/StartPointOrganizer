@@ -25,11 +25,13 @@ Private Type OrganizerStats
     StartChanged As Long
     RelativeHandleStarts As Long
     LineMidpointStarts As Long
+    ReverseFallbackStarts As Long
     NoCandidateFound As Long
     CandidateReadErrors As Long
     IncompleteSearches As Long
     DirectionRollbacks As Long
     StartRollbacks As Long
+    ReverseFallbackRollbacks As Long
     MidpointRollbacks As Long
     ValidationWarnings As Long
     Failures As Long
@@ -126,7 +128,8 @@ CleanExit:
     messageStyle = vbInformation
     If fatalNumber <> 0 Or closeNumber <> 0 Then
         messageStyle = vbCritical
-    ElseIf stats.Failures > 0 Or stats.ValidationWarnings > 0 Or stats.CandidateReadErrors > 0 Then
+    ElseIf stats.Failures > 0 Or stats.ValidationWarnings > 0 Or _
+           stats.CandidateReadErrors > 0 Or stats.NoCandidateFound > 0 Then
         messageText = "Selesai dengan catatan."
         messageStyle = vbExclamation
     Else
@@ -280,6 +283,10 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
     Dim mutationOperation As String
     Dim insertsMidpoint As Boolean
     Dim startValid As Boolean
+    Dim startClockwise As Boolean
+    Dim targetAngle As Double
+    Dim usingReverseFallback As Boolean
+    Dim fallbackNoCandidate As Boolean
     Dim errorNumber As Long
     Dim errorSource As String
     Dim errorDescription As String
@@ -312,42 +319,88 @@ Private Sub ProcessSubPath(ByVal crv As Curve, ByVal subpathIndex As Long, _
         stats.DirectionReversed = stats.DirectionReversed + 1
     End If
 
-    found = SPOFindStartCandidate(sp, sourceUnit, candidate, diagnostics)
+    ' Arah tangent mengikuti mode pilihan, termasuk ketika arah fallback dibalik.
+    If targetClockwise Then
+        targetAngle = 0#
+    Else
+        targetAngle = 180#
+    End If
+    found = SPOFindStartCandidate(sp, sourceUnit, candidate, diagnostics, False, targetAngle)
     RecordCandidateDiagnostics stats, diagnostics
     diagnosticsRecorded = True
+    startClockwise = targetClockwise
     If Not found Then
         If diagnostics.ReadErrors > 0 Then
             stats.IncompleteSearches = stats.IncompleteSearches + 1
-        Else
-            stats.NoCandidateFound = stats.NoCandidateFound + 1
+            Exit Sub
         End If
-        Exit Sub
+
+        ' Arah fallback dan startpoint-nya harus commit atau pulih bersama.
+        usingReverseFallback = True
+        mutationOperation = "fallback arah terbalik"
+        Set mutationBackup = crv.GetCopy
+        If mutationBackup Is Nothing Then Err.Raise ERR_DIRECTION_FAILED, "ProcessSubPath", "Backup fallback tidak tersedia."
+        mutationPending = True
+        startClockwise = Not targetClockwise
+        sp.ReverseDirection
+        Set sp = crv.SubPaths(subpathIndex)
+        If Not sp.Closed Or sp.IsClockwise <> startClockwise Then
+            Err.Raise ERR_DIRECTION_FAILED, "ProcessSubPath", "Validasi arah fallback gagal."
+        End If
+        diagnosticsRecorded = False
+        found = SPOFindStartCandidate(sp, sourceUnit, candidate, diagnostics, True, targetAngle)
+        RecordCandidateDiagnostics stats, diagnostics
+        diagnosticsRecorded = True
+        If Not found Then
+            If diagnostics.ReadErrors > 0 Then
+                stats.IncompleteSearches = stats.IncompleteSearches + 1
+            Else
+                stats.NoCandidateFound = stats.NoCandidateFound + 1
+            End If
+            fallbackNoCandidate = True
+            errorNumber = diagnostics.FirstNumber
+            errorSource = diagnostics.FirstSource
+            errorDescription = "Tidak ada kandidat valid pada arah fallback. " & diagnostics.FirstDescription
+            GoTo RollbackMutation
+        End If
     End If
 
-    If candidate.IsCurrentStart Then
+    If candidate.IsCurrentStart And Not usingReverseFallback Then
         stats.StartAlreadyCorrect = stats.StartAlreadyCorrect + 1
         Exit Sub
     End If
 
     ' Transaksi startpoint terpisah dari arah yang sudah berhasil diterapkan.
-    mutationOperation = "pemindahan startpoint"
     insertsMidpoint = (candidate.SegmentIndex > 0)
-    Set mutationBackup = crv.GetCopy
-    If mutationBackup Is Nothing Then Err.Raise ERR_START_FAILED, "ProcessSubPath", "Backup startpoint tidak tersedia."
-    mutationPending = True
-
-    candidateIndex = SPOMaterializeStartCandidate(crv, subpathIndex, candidate)
-    If Not SetSubPathStartNode(crv, subpathIndex, candidateIndex, targetClockwise) Then
-        Err.Raise ERR_START_FAILED, "ProcessSubPath", "Pemindahan startpoint gagal."
+    If Not usingReverseFallback Then
+        mutationOperation = "pemindahan startpoint"
+        Set mutationBackup = crv.GetCopy
+        If mutationBackup Is Nothing Then Err.Raise ERR_START_FAILED, "ProcessSubPath", "Backup startpoint tidak tersedia."
+        mutationPending = True
     End If
 
-    startValid = ValidateSubPathStart(crv, subpathIndex, targetClockwise, sourceUnit, candidate)
+    If Not candidate.IsCurrentStart Then
+        candidateIndex = SPOMaterializeStartCandidate(crv, subpathIndex, candidate)
+        If Not SetSubPathStartNode(crv, subpathIndex, candidateIndex, startClockwise) Then
+            Err.Raise ERR_START_FAILED, "ProcessSubPath", "Pemindahan startpoint gagal."
+        End If
+    End If
+
+    startValid = ValidateSubPathStart(crv, subpathIndex, startClockwise, sourceUnit, candidate)
     If Not startValid Then
         stats.ValidationWarnings = stats.ValidationWarnings + 1
         Err.Raise ERR_START_VALIDATION_FAILED, "ProcessSubPath", "Validasi startpoint gagal."
     End If
     mutationPending = False
     Set mutationBackup = Nothing
+    If usingReverseFallback Then
+        stats.DirectionReversed = stats.DirectionReversed + 1
+        stats.ReverseFallbackStarts = stats.ReverseFallbackStarts + 1
+    End If
+    If candidate.IsCurrentStart Then
+        stats.StartAlreadyCorrect = stats.StartAlreadyCorrect + 1
+        Exit Sub
+    End If
     stats.StartChanged = stats.StartChanged + 1
     Select Case candidate.Tier
         Case spoStartRelativeHandle
@@ -363,6 +416,11 @@ SubPathFail:
     errorDescription = Err.Description
     SaveFirstError "ProcessSubPath / direction / candidate processing"
     If Not diagnosticsRecorded Then RecordCandidateDiagnostics stats, diagnostics
+
+RollbackMutation:
+    ' Termasuk jalur tanpa kandidat: error restore harus langsung diteruskan,
+    ' bukan masuk lagi ke handler yang sama dan mencoba restore dua kali.
+    On Error GoTo 0
     If mutationPending Then
         ' Pemulihan dibatasi pada curve ini; tidak memanggil Undo dokumen.
         If Not TryRestoreCurve(crv, mutationBackup, subpathIndex, _
@@ -374,11 +432,15 @@ SubPathFail:
         mutationPending = False
         If mutationOperation = "pembalikan arah" Then
             stats.DirectionRollbacks = stats.DirectionRollbacks + 1
+        ElseIf usingReverseFallback Then
+            stats.ReverseFallbackRollbacks = stats.ReverseFallbackRollbacks + 1
+            If insertsMidpoint Then stats.MidpointRollbacks = stats.MidpointRollbacks + 1
         Else
             stats.StartRollbacks = stats.StartRollbacks + 1
             If insertsMidpoint Then stats.MidpointRollbacks = stats.MidpointRollbacks + 1
         End If
     End If
+    If fallbackNoCandidate Then Exit Sub
     If SPOIsFatalError(errorNumber) Then Err.Raise errorNumber, errorSource, errorDescription
     stats.Failures = stats.Failures + 1
     Err.Clear
@@ -502,11 +564,13 @@ Private Function BuildSummary(ByRef stats As OrganizerStats) As String
         "Start point diubah: " & stats.StartChanged & vbCrLf & _
         "Start point diubah via handle 5%: " & stats.RelativeHandleStarts & vbCrLf & _
         "Start point diubah via midpoint garis: " & stats.LineMidpointStarts & vbCrLf & _
-        "Tidak ada kandidat 0 +/- 15 derajat: " & stats.NoCandidateFound & vbCrLf & _
+        "Subpath via fallback arah terbalik: " & stats.ReverseFallbackStarts & vbCrLf & _
+        "Tidak ada kandidat tangent sesuai mode +/- 15 derajat: " & stats.NoCandidateFound & vbCrLf & _
         "Pencarian tanpa hasil dengan error pembacaan: " & stats.IncompleteSearches & vbCrLf & _
         "Percobaan baca kandidat gagal: " & stats.CandidateReadErrors & vbCrLf & _
         "Pembalikan arah dipulihkan: " & stats.DirectionRollbacks & vbCrLf & _
         "Pemindahan startpoint dipulihkan: " & stats.StartRollbacks & vbCrLf & _
+        "Fallback arah terbalik dipulihkan: " & stats.ReverseFallbackRollbacks & vbCrLf & _
         "Midpoint dipulihkan: " & stats.MidpointRollbacks & vbCrLf & _
         "Warning validasi: " & stats.ValidationWarnings & vbCrLf & _
         "Failure: " & stats.Failures

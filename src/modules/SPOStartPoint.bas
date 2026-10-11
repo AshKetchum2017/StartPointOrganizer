@@ -33,6 +33,7 @@ Public Enum SPOStartTier
     spoStartFixedHandle = 1
     spoStartRelativeHandle = 2
     spoStartLineMidpoint = 3
+    spoStartReverseLineMidpoint = 4
 End Enum
 
 Public Type SPOStartCandidate
@@ -41,14 +42,19 @@ Public Type SPOStartCandidate
     SegmentIndex As Long ' Nonzero only when a midpoint node must be inserted.
     IsCurrentStart As Boolean
     AngleDifference As Double
+    TargetAngle As Double
     PositionX As Double
     PositionY As Double
 End Type
 
 Public Function SPOFindStartCandidate(ByVal sp As SubPath, ByVal sourceUnit As cdrUnit, _
                                       ByRef candidate As SPOStartCandidate, _
-                                      ByRef diagnostics As SPOCandidateDiagnostics) As Boolean
+                                      ByRef diagnostics As SPOCandidateDiagnostics, _
+                                      Optional ByVal reverseFallback As Boolean = False, _
+                                      Optional ByVal targetAngle As Double = 0#) As Boolean
     Dim tier As Long
+    Dim firstTier As Long
+    Dim lastTier As Long
     Dim itemIndex As Long
     Dim trial As SPOStartCandidate
     Dim mmPerUnit As Double
@@ -59,6 +65,7 @@ Public Function SPOFindStartCandidate(ByVal sp As SubPath, ByVal sourceUnit As c
     candidate.SegmentIndex = 0
     candidate.IsCurrentStart = False
     candidate.AngleDifference = ANGLE_TOLERANCE + 1#
+    candidate.TargetAngle = targetAngle
     candidate.PositionX = 0#
     candidate.PositionY = 0#
     diagnostics.ReadErrors = 0
@@ -71,26 +78,31 @@ Public Function SPOFindStartCandidate(ByVal sp As SubPath, ByVal sourceUnit As c
 
     ' Selesaikan satu tingkatan secara utuh sebelum mempertimbangkan tingkatan berikutnya.
     ' Temuan awal yang hanya memenuhi syarat 5% tidak boleh menutupi kandidat berukuran 0,5 mm di tempat lain.
-    For tier = spoStartFixedHandle To spoStartLineMidpoint
+    firstTier = spoStartFixedHandle
+    lastTier = spoStartLineMidpoint
+    If reverseFallback Then
+        ' Caller sudah membalik arah dalam transaksi; tier ini hanya mencari garis.
+        firstTier = spoStartReverseLineMidpoint
+        lastTier = spoStartReverseLineMidpoint
+    End If
+    For tier = firstTier To lastTier
         readErrorsBeforeTier = diagnostics.ReadErrors
-        If TryReadNodeCandidate(sp, 0, tier, mmPerUnit, trial, diagnostics) = spoCandidateEligible Then
+        If TryReadNodeCandidate(sp, 0, tier, mmPerUnit, targetAngle, trial, diagnostics) = spoCandidateEligible Then
             CopyCandidate candidate, trial
-            SPOFindStartCandidate = True
-            Exit Function
         End If
 
         For itemIndex = 1 To sp.Nodes.Count
-            If TryReadNodeCandidate(sp, itemIndex, tier, mmPerUnit, trial, diagnostics) = spoCandidateEligible Then
-                If trial.AngleDifference < candidate.AngleDifference Then
+            If TryReadNodeCandidate(sp, itemIndex, tier, mmPerUnit, targetAngle, trial, diagnostics) = spoCandidateEligible Then
+                If IsBetterCandidate(trial, candidate, reverseFallback) Then
                     CopyCandidate candidate, trial
                 End If
             End If
         Next itemIndex
 
-        If tier = spoStartLineMidpoint Then
+        If tier = spoStartLineMidpoint Or tier = spoStartReverseLineMidpoint Then
             For itemIndex = 1 To sp.Segments.Count
-                If TryReadLineCandidate(sp, itemIndex, mmPerUnit, trial, diagnostics) = spoCandidateEligible Then
-                    If trial.AngleDifference < candidate.AngleDifference Then
+                If TryReadLineCandidate(sp, itemIndex, tier, mmPerUnit, targetAngle, trial, diagnostics) = spoCandidateEligible Then
+                    If IsBetterCandidate(trial, candidate, reverseFallback) Then
                         CopyCandidate candidate, trial
                     End If
                 End If
@@ -107,13 +119,29 @@ Public Function SPOFindStartCandidate(ByVal sp As SubPath, ByVal sourceUnit As c
     Next tier
 End Function
 
+Private Function IsBetterCandidate(ByRef trial As SPOStartCandidate, ByRef current As SPOStartCandidate, _
+                                   ByVal lowestFirst As Boolean) As Boolean
+    If current.Tier = spoStartNone Then
+        IsBetterCandidate = True
+    ElseIf trial.PositionY <> current.PositionY Then
+        If lowestFirst Then
+            IsBetterCandidate = (trial.PositionY < current.PositionY)
+        Else
+            IsBetterCandidate = (trial.PositionY > current.PositionY)
+        End If
+    Else
+        IsBetterCandidate = (trial.PositionX < current.PositionX)
+    End If
+End Function
+
 Private Function TryReadNodeCandidate(ByVal sp As SubPath, ByVal itemIndex As Long, _
                                       ByVal tier As SPOStartTier, ByVal mmPerUnit As Double, _
+                                      ByVal targetAngle As Double, _
                                       ByRef trial As SPOStartCandidate, _
                                       ByRef diagnostics As SPOCandidateDiagnostics) As SPOCandidateResult
     Dim operation As String
     On Error GoTo ReadFailed
-    If ReadNodeCandidate(sp, itemIndex, tier, mmPerUnit, trial, operation) Then
+    If ReadNodeCandidate(sp, itemIndex, tier, mmPerUnit, targetAngle, trial, operation) Then
         TryReadNodeCandidate = spoCandidateEligible
     End If
     Exit Function
@@ -124,6 +152,7 @@ End Function
 
 Private Function ReadNodeCandidate(ByVal sp As SubPath, ByVal itemIndex As Long, _
                                    ByVal tier As SPOStartTier, ByVal mmPerUnit As Double, _
+                                   ByVal targetAngle As Double, _
                                    ByRef trial As SPOStartCandidate, ByRef operation As String) As Boolean
     Dim n As Node
     Dim diff As Double
@@ -134,42 +163,53 @@ Private Function ReadNodeCandidate(ByVal sp As SubPath, ByVal itemIndex As Long,
         Set n = sp.Nodes(itemIndex)
     End If
     operation = "EvaluateStartCandidate"
-    If Not EvaluateStartCandidate(sp, n, tier, mmPerUnit, diff) Then Exit Function
+    If Not EvaluateStartCandidate(sp, n, tier, mmPerUnit, targetAngle, diff) Then Exit Function
     operation = "Membaca index dan posisi node"
-    StoreNodeCandidate trial, n, tier, diff
+    StoreNodeCandidate trial, n, tier, targetAngle, diff
     trial.IsCurrentStart = (itemIndex = 0)
     ReadNodeCandidate = True
 End Function
 
 Private Function TryReadLineCandidate(ByVal sp As SubPath, ByVal itemIndex As Long, _
-                                      ByVal mmPerUnit As Double, ByRef trial As SPOStartCandidate, _
+                                      ByVal tier As SPOStartTier, ByVal mmPerUnit As Double, _
+                                      ByVal targetAngle As Double, _
+                                      ByRef trial As SPOStartCandidate, _
                                       ByRef diagnostics As SPOCandidateDiagnostics) As SPOCandidateResult
     Dim operation As String
     On Error GoTo ReadFailed
-    If ReadLineCandidate(sp, itemIndex, mmPerUnit, trial, operation) Then
+    If ReadLineCandidate(sp, itemIndex, tier, mmPerUnit, targetAngle, trial, operation) Then
         TryReadLineCandidate = spoCandidateEligible
     End If
     Exit Function
 ReadFailed:
-    RecordCandidateReadError diagnostics, "Segment " & itemIndex & ", tier 3 / " & operation
+    RecordCandidateReadError diagnostics, "Segment " & itemIndex & ", tier " & tier & " / " & operation
     TryReadLineCandidate = spoCandidateReadError
 End Function
 
 Private Function ReadLineCandidate(ByVal sp As SubPath, ByVal itemIndex As Long, _
-                                   ByVal mmPerUnit As Double, ByRef trial As SPOStartCandidate, _
+                                   ByVal tier As SPOStartTier, ByVal mmPerUnit As Double, _
+                                   ByVal targetAngle As Double, _
+                                   ByRef trial As SPOStartCandidate, _
                                    ByRef operation As String) As Boolean
     Dim seg As Segment
     Dim diff As Double
+    Dim nodeDiff As Double
     operation = "Membaca segment"
     Set seg = sp.Segments(itemIndex)
     operation = "EvaluateLineSegment"
-    If Not EvaluateLineSegment(seg, mmPerUnit, diff) Then Exit Function
+    If Not EvaluateLineSegment(seg, mmPerUnit, targetAngle, diff) Then Exit Function
+    ' Node midpoint lama sudah diperiksa dalam loop node. Jangan memilih
+    ' midpoint dari separuh garisnya karena urutan Y/X, pada pencarian atas maupun bawah.
+    operation = "Mengenali endpoint midpoint lama"
+    If EvaluateStartCandidate(sp, seg.StartNode, tier, mmPerUnit, targetAngle, nodeDiff) Then Exit Function
+    If EvaluateStartCandidate(sp, seg.EndNode, tier, mmPerUnit, targetAngle, nodeDiff) Then Exit Function
     operation = "Membaca index dan endpoint segment"
-    trial.Tier = spoStartLineMidpoint
+    trial.Tier = tier
     trial.NodeIndex = 0
     trial.SegmentIndex = seg.Index
     trial.IsCurrentStart = False
     trial.AngleDifference = diff
+    trial.TargetAngle = targetAngle
     trial.PositionX = (seg.StartNode.PositionX + seg.EndNode.PositionX) / 2#
     trial.PositionY = (seg.StartNode.PositionY + seg.EndNode.PositionY) / 2#
     ReadLineCandidate = True
@@ -181,6 +221,7 @@ Private Sub CopyCandidate(ByRef destination As SPOStartCandidate, ByRef source A
     destination.SegmentIndex = source.SegmentIndex
     destination.IsCurrentStart = source.IsCurrentStart
     destination.AngleDifference = source.AngleDifference
+    destination.TargetAngle = source.TargetAngle
     destination.PositionX = source.PositionX
     destination.PositionY = source.PositionY
 End Sub
@@ -239,11 +280,12 @@ Public Function SPOValidateStartCandidate(ByVal sp As SubPath, ByVal sourceUnit 
     ' Node indices can change after BreakApart/JoinWith; check the position.
     If Abs(n.PositionX - expected.PositionX) * mmPerUnit > MIDPOINT_TOLERANCE_MM Then Exit Function
     If Abs(n.PositionY - expected.PositionY) * mmPerUnit > MIDPOINT_TOLERANCE_MM Then Exit Function
-    SPOValidateStartCandidate = EvaluateStartCandidate(sp, n, expected.Tier, mmPerUnit, diff)
+    SPOValidateStartCandidate = EvaluateStartCandidate(sp, n, expected.Tier, mmPerUnit, expected.TargetAngle, diff)
 End Function
 
 Private Function EvaluateStartCandidate(ByVal sp As SubPath, ByVal n As Node, _
                                          ByVal tier As SPOStartTier, ByVal mmPerUnit As Double, _
+                                         ByVal targetAngle As Double, _
                                          ByRef diff As Double) As Boolean
     Dim incoming As Segment
     Dim outgoing As Segment
@@ -267,7 +309,7 @@ Private Function EvaluateStartCandidate(ByVal sp As SubPath, ByVal n As Node, _
     If incomingLengthMM <= GEOMETRY_EPSILON_MM Then Exit Function
     If outgoingLengthMM <= GEOMETRY_EPSILON_MM Then Exit Function
 
-    If tier = spoStartLineMidpoint Then
+    If tier = spoStartLineMidpoint Or tier = spoStartReverseLineMidpoint Then
         ' Gunakan kembali titik tengah yang disisipkan pada tahap pengerjaan sebelumnya:
         ' gabungan dua bagian garis yang sama panjang dan segaris harus tetap memenuhi ambang batas awal sebesar 2 mm.
         If incoming.Type <> cdrLineSegment Then Exit Function
@@ -305,16 +347,17 @@ Private Function EvaluateStartCandidate(ByVal sp As SubPath, ByVal n As Node, _
         If AngleDistance(incomingAngle, outgoingAngle) > MAX_TANGENT_DIFFERENCE + NUMERIC_EPSILON Then Exit Function
     End If
 
-    diff = AngleDistance(outgoingAngle, 0#)
+    diff = AngleDistance(outgoingAngle, targetAngle)
     EvaluateStartCandidate = (diff <= ANGLE_TOLERANCE + NUMERIC_EPSILON)
 End Function
 
 Private Function EvaluateLineSegment(ByVal seg As Segment, ByVal mmPerUnit As Double, _
+                                      ByVal targetAngle As Double, _
                                       ByRef diff As Double) As Boolean
     If seg.Type <> cdrLineSegment Then Exit Function
     If Not MeetsMinimum(Abs(seg.Length) * mmPerUnit, MIN_STRAIGHT_SEGMENT_LENGTH_MM) Then Exit Function
     ' Titik interior dari suatu ruas garis tidak memiliki sudut pada titik awal yang baru.
-    diff = AngleDistance(seg.GetTangentAt(0.5, cdrRelativeSegmentOffset), 0#)
+    diff = AngleDistance(seg.GetTangentAt(0.5, cdrRelativeSegmentOffset), targetAngle)
     EvaluateLineSegment = (diff <= ANGLE_TOLERANCE + NUMERIC_EPSILON)
 End Function
 
@@ -338,11 +381,12 @@ ControlAngleFallback:
 End Function
 
 Private Sub StoreNodeCandidate(ByRef candidate As SPOStartCandidate, ByVal n As Node, _
-                                ByVal tier As SPOStartTier, ByVal diff As Double)
+                                ByVal tier As SPOStartTier, ByVal targetAngle As Double, ByVal diff As Double)
     candidate.Tier = tier
     candidate.NodeIndex = n.Index
     candidate.SegmentIndex = 0
     candidate.AngleDifference = diff
+    candidate.TargetAngle = targetAngle
     candidate.PositionX = n.PositionX
     candidate.PositionY = n.PositionY
 End Sub

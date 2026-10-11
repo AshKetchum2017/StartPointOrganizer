@@ -17,3 +17,9 @@
 ~ Error pembacaan satu kandidat dicatat tanpa menghentikan pencarian kandidat sehat dalam tier yang sama. Fallback ke tier lebih rendah diblokir jika tier sebelumnya belum dapat dipastikan tidak memiliki kandidat valid.
 ~ Pembalikan arah dan pemindahan startpoint pada semua tier dilindungi snapshot terpisah. Kegagalan startpoint memulihkan curve tanpa membatalkan arah yang sudah berhasil diterapkan; proses berhenti jika pemulihan gagal.
 ~ Penutupan CommandGroup diperiksa, dengan pemberitahuan terpisah untuk error operasi dan error cleanup.
+
+------------------------------------------------------------------------------------------------------------------------------------------------------
+2026-10-11
++ Menambahkan fallback terakhir berupa midpoint garis lurus minimal 2 mm dari bawah subpath dengan arah kebalikan pilihan pengguna, setelah ketiga tier normal tidak menemukan kandidat.
+~ Pencarian normal CW dan CCW kini sama-sama memilih kandidat dari atas, lalu kiri; tangent keluar mengikuti mode: CW 0 derajat dan CCW 180 derajat, dengan toleransi +/-15 derajat.
+~ Pembalikan arah fallback dan pemindahan Start Point dipulihkan bersama jika gagal. Midpoint digunakan ulang saat dijalankan kembali; subpath tanpa kandidat dilaporkan dalam ringkasan.
