@@ -608,7 +608,6 @@ Private Sub ShowMessageAfterClose(ByVal messageText As String, _
     Me.Hide
     DoEvents
     MsgBox messageText, messageStyle, "Start Point Organizer"
-    Unload Me
 End Sub
 
 ' Called only by MRTargetBridge; normal menu entry points remain unchanged.
