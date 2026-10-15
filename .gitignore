@@ -7,6 +7,7 @@
 
 # Include Changelog to be tracked by git
 !Changelog.log
+!README.md
 
 # Ignore specific files in the project directory
 StartPointWizard.bas
